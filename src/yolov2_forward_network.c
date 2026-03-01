@@ -3,12 +3,20 @@
 
 #define GEMMCONV
 
-// calibration config (dynamic histogram + EMA)
+// simple comparator for qsort used by percentile computation
+static int compare_floats(const void *p1, const void *p2)
+{
+    float a = *(const float*)p1;
+    float b = *(const float*)p2;
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+
+// calibration config (hybrid strategy: percentile, max, EMA)
 #include "calib_config.h"
 
-#ifndef CALIB_USE_PERCENTILE
-#define CALIB_USE_PERCENTILE 1
-#endif
+// histogram-based calibration disabled in plan_2; always use max+EMA
 
 static float ema_multipliers[TOTAL_CALIB_LAYER] = {0};
 
@@ -51,58 +59,60 @@ void forward_convolutional_layer_cpu(layer l, network_state state)
     ////}}}
     // convolution as GEMM (as part of BLAS)
     for (i = 0; i < l.batch; ++i) {
-        // --- Calibration: dynamic histogram per-image + EMA accumulation (or simple minmax) ---
+        // --- Calibration: hybrid per-layer strategy ---
         {
+            int idx = state.index;
             int inputs = l.c * l.h * l.w;
             float current_max = 1e-6f;
-            int ii;
-            for (ii = 0; ii < inputs; ++ii) {
+            for (int ii = 0; ii < inputs; ++ii) {
                 float v = fabsf(state.input[ii]);
                 if (v > current_max) current_max = v;
             }
-#if CALIB_USE_PERCENTILE
-            int *local_hist = (int*)calloc(CALIB_NUM_BINS, sizeof(int));
-            if (local_hist) {
-                for (ii = 0; ii < inputs; ++ii) {
-                    float v = fabsf(state.input[ii]);
-                    int bin = (int)((v / current_max) * (CALIB_NUM_BINS - 1));
-                    if (bin < 0) bin = 0;
-                    if (bin >= CALIB_NUM_BINS) bin = CALIB_NUM_BINS - 1;
-                    local_hist[bin]++;
-                }
-                long long target = (long long)(inputs * CALIB_PERCENTILE);
-                long long cumulative = 0;
-                float optimal_threshold = current_max;
-                int bidx;
-                for (bidx = 0; bidx < CALIB_NUM_BINS; ++bidx) {
-                    cumulative += local_hist[bidx];
-                    if (cumulative >= target) {
-                        optimal_threshold = ((float)bidx / (CALIB_NUM_BINS - 1)) * current_max;
-                        break;
+
+            float current_multiplier;
+            // early layers use percentile clipping
+            if (idx >= 0 && idx <= CALIB_PERCENTILE_LAYER_END) {
+                // compute percentile threshold by sorting absolute values
+                float *vals = (float*)malloc(inputs * sizeof(float));
+                if (vals) {
+                    for (int ii = 0; ii < inputs; ++ii) {
+                        vals[ii] = fabsf(state.input[ii]);
                     }
+                    // sort ascending
+                    qsort(vals, inputs, sizeof(float), compare_floats);
+                    long long idx_target = (long long)(inputs * CALIB_PERCENTILE);
+                    if (idx_target < 0) idx_target = 0;
+                    if (idx_target >= inputs) idx_target = inputs - 1;
+                    float threshold = vals[idx_target];
+                    if (threshold <= 1e-4f) threshold = 1e-4f;
+                    current_multiplier = (float)(QUANT_MAX_VAL) / threshold;
+                    free(vals);
+                } else {
+                    current_multiplier = (float)(QUANT_MAX_VAL) / current_max;
                 }
-                if (optimal_threshold <= 1e-4f) optimal_threshold = 1e-4f;
-                float current_multiplier = (float)(QUANT_MAX_VAL) / optimal_threshold;
-                if (state.index >= 0 && state.index < TOTAL_CALIB_LAYER) {
-                    if (ema_multipliers[state.index] == 0.0f) ema_multipliers[state.index] = current_multiplier;
-                    else ema_multipliers[state.index] = CALIB_EMA_ALPHA * current_multiplier + (1.0f - CALIB_EMA_ALPHA) * ema_multipliers[state.index];
+            } else {
+                // max-based clipping for other layers
+                current_multiplier = (float)(QUANT_MAX_VAL) / current_max;
+            }
+
+            // apply EMA smoothing only for detection head and beyond
+            if (idx >= CALIB_EMA_LAYER_START && idx < TOTAL_CALIB_LAYER) {
+                if (ema_multipliers[idx] == 0.0f) {
+                    ema_multipliers[idx] = current_multiplier;
+                } else {
+                    ema_multipliers[idx] = CALIB_EMA_ALPHA * current_multiplier +
+                                           (1.0f - CALIB_EMA_ALPHA) * ema_multipliers[idx];
                 }
-                free(local_hist);
+            } else {
+                // store raw multiplier for early/max-only layers
+                ema_multipliers[idx] = current_multiplier;
             }
-#else
-            float current_multiplier = (float)(QUANT_MAX_VAL) / current_max;
-            if (state.index >= 0 && state.index < TOTAL_CALIB_LAYER) {
-                if (ema_multipliers[state.index] == 0.0f) ema_multipliers[state.index] = current_multiplier;
-                else ema_multipliers[state.index] = CALIB_EMA_ALPHA * current_multiplier + (1.0f - CALIB_EMA_ALPHA) * ema_multipliers[state.index];
-            }
-#endif
-            // Write the compact multipliers file (overwrite)
+
+            // write the entire table each image; non-EMA entries simply hold latest value
             FILE *fp = fopen("calibration_multipliers.txt", "w");
             if (fp) {
-                int idx;
-                for (idx = 0; idx < TOTAL_CALIB_LAYER; ++idx) {
-                    // printf("Layer %d: %d", idx, ema_multipliers[idx]);
-                    if (ema_multipliers[idx] > 0.0f) fprintf(fp, "%d %f\n", idx, ema_multipliers[idx]);
+                for (int k2 = 0; k2 < TOTAL_CALIB_LAYER; ++k2) {
+                    if (ema_multipliers[k2] > 0.0f) fprintf(fp, "%d %f\n", k2, ema_multipliers[k2]);
                 }
                 fclose(fp);
             }
