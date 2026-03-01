@@ -10,6 +10,13 @@ Usage:
 
    python3 tools/grid_search.py
 
+The script now tries two calibration methods:
+
+- **percentile**: dynamic histogram & percentile threshold (default).
+- **minmax**: simple min/max scaling without histogram computation.
+
+In the log and best_params.txt the chosen method is included alongside other parameters.
+
 Results:
 - tools/best_params.txt — best found combination (overwritten as improvements found)
 - tools/grid_search_log.txt — appended log of all runs

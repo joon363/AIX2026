@@ -6,6 +6,10 @@
 // calibration config (dynamic histogram + EMA)
 #include "calib_config.h"
 
+#ifndef CALIB_USE_PERCENTILE
+#define CALIB_USE_PERCENTILE 1
+#endif
+
 static float ema_multipliers[TOTAL_CALIB_LAYER] = {0};
 
 // 4 layers in 1: convolution, batch-normalization, BIAS and activation
@@ -47,7 +51,7 @@ void forward_convolutional_layer_cpu(layer l, network_state state)
     ////}}}
     // convolution as GEMM (as part of BLAS)
     for (i = 0; i < l.batch; ++i) {
-        // --- Calibration: dynamic histogram per-image + EMA accumulation ---
+        // --- Calibration: dynamic histogram per-image + EMA accumulation (or simple minmax) ---
         {
             int inputs = l.c * l.h * l.w;
             float current_max = 1e-6f;
@@ -56,6 +60,7 @@ void forward_convolutional_layer_cpu(layer l, network_state state)
                 float v = fabsf(state.input[ii]);
                 if (v > current_max) current_max = v;
             }
+#if CALIB_USE_PERCENTILE
             int *local_hist = (int*)calloc(CALIB_NUM_BINS, sizeof(int));
             if (local_hist) {
                 for (ii = 0; ii < inputs; ++ii) {
@@ -84,6 +89,13 @@ void forward_convolutional_layer_cpu(layer l, network_state state)
                 }
                 free(local_hist);
             }
+#else
+            float current_multiplier = (float)(QUANT_MAX_VAL) / current_max;
+            if (state.index >= 0 && state.index < TOTAL_CALIB_LAYER) {
+                if (ema_multipliers[state.index] == 0.0f) ema_multipliers[state.index] = current_multiplier;
+                else ema_multipliers[state.index] = CALIB_EMA_ALPHA * current_multiplier + (1.0f - CALIB_EMA_ALPHA) * ema_multipliers[state.index];
+            }
+#endif
             // Write the compact multipliers file (overwrite)
             FILE *fp = fopen("calibration_multipliers.txt", "w");
             if (fp) {

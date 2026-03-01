@@ -2,6 +2,10 @@
 // softmax_layer.h, reorg_layer.h, route_layer.h, region_layer.h, maxpool_layer.h, convolutional_layer.h
 #include "calib_config.h"
 
+#ifndef CALIB_USE_PERCENTILE
+#define CALIB_USE_PERCENTILE 1
+#endif
+
 #define GEMMCONV
 
 //#define SSE41
@@ -294,39 +298,10 @@ float *network_predict_quantized(network net, float *input)
 /* Quantization-related */
 
 void do_quantization(network net) {
-    int counter = 0;
-
     int j;
-	//Dummy weight_quantization 
-	// TODO
-	//{{{		
-	float weight_quant_multiplier[TOTAL_CALIB_LAYER] = {
-      16,	  //conv 0
-      64,     //conv 2
-      64,     //conv 4
-      64,     //conv 6
-      64,     //conv 8
-      64,     //conv 10
-      64,     //conv 12
-      64,     //conv 13
-      64,     //conv 14
-      64,     //conv 17
-      64};    //conv 20
-	
-    float input_quant_multiplier[TOTAL_CALIB_LAYER] = {
-     128,	  //conv 0
-      16,     //conv 2
-      16,     //conv 4
-      16,     //conv 6
-      16,     //conv 8
-      16,     //conv 10     
-      16,     //conv 12
-      16,     //conv 13
-      16,     //conv 14
-      16,     //conv 17
-      16};    //conv 20
 
-	printf("Multipler    Input    Weight    Bias\n");
+    printf("Multipler    Input    Weight    Bias\n");
+    
     // load calibration multipliers once
     float loaded_multipliers[200] = {0};
     FILE* fp_mul = fopen("calibration_multipliers.txt", "r");
@@ -343,51 +318,75 @@ void do_quantization(network net) {
     for (j = 0; j < net.n; ++j) {
         layer *l = &net.layers[j];
 
-        /*
-        TODO: implement quantization 
-        The implementation given below is a naive version of per-network quantization; implement your own quantization that minimizes the mAP degradation
-        */
-
         if (l->type == CONVOLUTIONAL) { // Quantize conv layer only            
             size_t const filter_size = l->size*l->size*l->c;
-
             int i, fil;
 
-            // Quantized Parameters
-            // Input feature map (use loaded calibration multipliers if available)
+            // ===== Input feature map quantization =====
             if (loaded_multipliers[j] > 0.0f) {
                 l->input_quant_multiplier = loaded_multipliers[j];
             } else {
-                l->input_quant_multiplier   = (counter < TOTAL_CALIB_LAYER) ? input_quant_multiplier [counter] : 16;
+                l->input_quant_multiplier = 16.0f;
             }
-            
-            // Weight
-            l->weights_quant_multiplier = (counter < TOTAL_CALIB_LAYER) ? weight_quant_multiplier[counter] : 16;
-            
-            ++counter;
-            // Weight Quantization
-			for (fil = 0; fil < l->n; ++fil) {          // 
+
+            // ===== Weight quantization (compute dynamically) =====
+            float max_weight = 1e-6f;
+            for (i = 0; i < l->size * l->size * l->c * l->n; ++i) {
+                float v = fabsf(l->weights[i]);
+                if (v > max_weight) max_weight = v;
+            }
+
+#if CALIB_USE_PERCENTILE
+            int *weight_hist = (int*)calloc(CALIB_NUM_BINS, sizeof(int));
+            if (weight_hist) {
+                for (i = 0; i < l->size * l->size * l->c * l->n; ++i) {
+                    float v = fabsf(l->weights[i]);
+                    int bin = (int)((v / max_weight) * (CALIB_NUM_BINS - 1));
+                    if (bin < 0) bin = 0;
+                    if (bin >= CALIB_NUM_BINS) bin = CALIB_NUM_BINS - 1;
+                    weight_hist[bin]++;
+                }
+                long long total_weights = (long long)(l->size * l->size * l->c * l->n);
+                long long target = (long long)(total_weights * CALIB_PERCENTILE);
+                long long cumulative = 0;
+                float threshold = max_weight;
+                int bidx;
+                for (bidx = 0; bidx < CALIB_NUM_BINS; ++bidx) {
+                    cumulative += weight_hist[bidx];
+                    if (cumulative >= target) {
+                        threshold = ((float)bidx / (CALIB_NUM_BINS - 1)) * max_weight;
+                        break;
+                    }
+                }
+                if (threshold <= 1e-6f) threshold = 1e-6f;
+                l->weights_quant_multiplier = (float)(QUANT_MAX_VAL) / threshold;
+                free(weight_hist);
+            } else {
+                l->weights_quant_multiplier = (float)(QUANT_MAX_VAL) / max_weight;
+            }
+#else
+            l->weights_quant_multiplier = (float)(QUANT_MAX_VAL) / max_weight;
+#endif
+
+            // ===== Quantize weights =====
+            for (fil = 0; fil < l->n; ++fil) {
                 for (i = 0; i < filter_size; ++i) {
-                    float w = l->weights[fil*filter_size + i] * l->weights_quant_multiplier; // Scale
-                    l->weights_int8[fil*filter_size + i] = max_abs(w, MAX_VAL_8); // Clip
+                    float w = l->weights[fil*filter_size + i] * l->weights_quant_multiplier;
+                    l->weights_int8[fil*filter_size + i] = max_abs(w, MAX_VAL_8);
                 }
             }
-            printf("Multipler    Input    Weight    Bias\n");
-            // Bias Quantization
+
+            // ===== Bias quantization =====
             float biases_multiplier = (l->weights_quant_multiplier * l->input_quant_multiplier);
             for (fil = 0; fil < l->n; ++fil) {
-                float b = l->biases[fil] * biases_multiplier; // Scale
-                l->biases_quant[fil] = max_abs(b, MAX_VAL_16); // Clip
+                float b = l->biases[fil] * biases_multiplier;
+                l->biases_quant[fil] = max_abs(b, MAX_VAL_16);
             }
 
             printf(" CONV%d: \t%g \t%g \t%g \n", j, l->input_quant_multiplier, l->weights_quant_multiplier, biases_multiplier);
         }
-        else {
-            //printf(" No quantization for layer %d (layer type: %d) \n", j, l->type);
-        }
     }
 }
-
 void save_quantized_model(network net) {
     int j;
     for (j = 0; j < net.n; ++j) {
