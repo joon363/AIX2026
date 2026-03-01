@@ -101,6 +101,7 @@ void forward_convolutional_layer_cpu(layer l, network_state state)
             if (fp) {
                 int idx;
                 for (idx = 0; idx < TOTAL_CALIB_LAYER; ++idx) {
+                    // printf("Layer %d: %d", idx, ema_multipliers[idx]);
                     if (ema_multipliers[idx] > 0.0f) fprintf(fp, "%d %f\n", idx, ema_multipliers[idx]);
                 }
                 fclose(fp);

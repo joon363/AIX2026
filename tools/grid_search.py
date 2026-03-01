@@ -24,8 +24,8 @@ LOG_FILE = ROOT / "tools" / "grid_search_log.txt"
 dry = "--dry-run" in sys.argv
 
 # Parameter options
-bins_list = [512, 1024, 2048]
-percentiles = [0.998, 0.999, 0.9995]
+bins_list = [1024, 2048]
+percentiles = [0.999, 0.9995, 0.9999]
 alphas = [0.15]
 methods = ["minmax", "percentile"]
 
@@ -55,7 +55,7 @@ def write_header(method, bins, perc, alpha):
         s += f"#define CALIB_PERCENTILE {perc}f\n"
     s += f"#define CALIB_EMA_ALPHA {alpha}f\n"
     s += "#define QUANT_MAX_VAL 127.0f\n"
-    s += "#define TOTAL_CALIB_LAYER 11\n"
+    s += "#define TOTAL_CALIB_LAYER 25\n"
     s += "#endif\n"
     CALIB_HEADER.write_text(s)
 

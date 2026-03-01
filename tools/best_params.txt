@@ -1,1 +1,1 @@
-best: bins=2048 perc=0.9995 alpha=0.15 mAP=0.722254
+best: bins=None perc=None alpha=0.15 mAP=0.772372

@@ -8,3 +8,10 @@ bins=1024 perc=0.9995 alpha=0.15 mAP=0.7201
 bins=2048 perc=0.998 alpha=0.15 mAP=0.649884
 bins=2048 perc=0.999 alpha=0.15 mAP=0.702635
 bins=2048 perc=0.9995 alpha=0.15 mAP=0.722254
+bins=None perc=None alpha=0.15 mAP=0.772372
+bins=1024 perc=0.999 alpha=0.15 mAP=0.678137
+bins=1024 perc=0.9995 alpha=0.15 mAP=0.719193
+bins=1024 perc=0.9999 alpha=0.15 mAP=0.763739
+bins=2048 perc=0.999 alpha=0.15 mAP=0.679163
+bins=2048 perc=0.9995 alpha=0.15 mAP=0.720866
+bins=2048 perc=0.9999 alpha=0.15 mAP=0.762778
