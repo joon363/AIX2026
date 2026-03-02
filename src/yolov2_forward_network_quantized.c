@@ -344,6 +344,34 @@ void do_quantization(network net) {
         fprintf(stderr, "[quant] calibration_multipliers.txt not found, using defaults\n");
     }
 
+    // 2. Weight Local Multiplier 캐시 준비 (메모리 효율을 위해 포인터 배열 사용)
+    float* cached_weight_muls[200] = {0}; // 최대 200개 레이어 가정
+    int has_weight_file = 0;
+    FILE* fp_w_read = fopen("weight_multipliers.txt", "r");
+    
+    if (fp_w_read) {
+        has_weight_file = 1;
+        int l_idx, f_idx;
+        float mul;
+        while (fscanf(fp_w_read, "%d %d %f", &l_idx, &f_idx, &mul) == 3) {
+            if (l_idx >= 0 && l_idx < 200) {
+                layer *l = &net.layers[l_idx];
+                if (!cached_weight_muls[l_idx]) {
+                    cached_weight_muls[l_idx] = (float*)calloc(l->n, sizeof(float));
+                }
+                if (f_idx < l->n) cached_weight_muls[l_idx][f_idx] = mul;
+            }
+        }
+        fclose(fp_w_read);
+        printf("[quant] Loaded weight multipliers from file.\n");
+    }
+
+    // 결과를 파일에 쓰기 위해 append 모드로 열 준비 (파일이 없을 때만 사용)
+    FILE* fp_w_write = NULL;
+    if (!has_weight_file) {
+        fp_w_write = fopen("weight_multipliers.txt", "w");
+    }
+
     for (j = 0; j < net.n; ++j) {
         layer *l = &net.layers[j];
 
@@ -358,100 +386,58 @@ void do_quantization(network net) {
                 l->input_quant_multiplier = 16.0f;
             }
 
-            // ===== Weight quantization (compute dynamically) =====
-            // compute percentile threshold by sorting absolute weight values
-            int total_weights = l->size * l->size * l->c * l->n;
+            float *local_mul = NULL;
 
-            float *vals = (float*)malloc(total_weights * sizeof(float));
-
-            if (vals) {
-
-                for (i = 0; i < total_weights; ++i) {
-                    vals[i] = fabsf(l->weights[i]);
-                }
-
-                // sort ascending
-                qsort(vals, total_weights, sizeof(float), compare_floats);
-
-                long long idx_target =
-                    (long long)(total_weights * CALIB_PERCENTILE);
-
-                if (idx_target < 0)
-                    idx_target = 0;
-
-                if (idx_target >= total_weights)
-                    idx_target = total_weights - 1;
-
-                float threshold = vals[idx_target];
-
-                if (threshold <= 1e-6f)
-                    threshold = 1e-6f;
-
-                l->weights_quant_multiplier =
-                    (float)(QUANT_MAX_VAL) / threshold;
-
-                free(vals);
-
+            // 3. 파일에서 읽어온 값이 있는지 확인
+            if (has_weight_file && cached_weight_muls[j]) {
+                local_mul = cached_weight_muls[j];
             } else {
-                // fallback: max-based
-                l->weights_quant_multiplier =
-                    (float)(QUANT_MAX_VAL) / max_weight;
-            }
-
-            // ===== Quantize weights =====
-            // -------------------------------
-            // Per-channel local multipliers
-            // -------------------------------
-            float *local_mul = (float*)calloc(l->n, sizeof(float));
-
-            for (fil = 0; fil < l->n; ++fil) {
-
-                float max_w = 1e-6f;
-
-                for (i = 0; i < filter_size; ++i) {
-                    float v = fabsf(l->weights[fil*filter_size + i]);
-                    if (v > max_w) max_w = v;
-                }
-
-                local_mul[fil] = (float)(QUANT_MAX_VAL) / max_w;
-
-                for (i = 0; i < filter_size; ++i) {
-                    float w = l->weights[fil*filter_size + i] * local_mul[fil];
-                    l->weights_int8[fil*filter_size + i] =
-                        max_abs(w, MAX_VAL_8);
+                local_mul = (float*)calloc(l->n, sizeof(float));
+                for (fil = 0; fil < l->n; ++fil) {
+                    float max_w = 1e-6f;
+                    for (i = 0; i < filter_size; ++i) {
+                        float v = fabsf(l->weights[fil * filter_size + i]);
+                        if (v > max_w) max_w = v;
+                    }
+                    local_mul[fil] = (float)(QUANT_MAX_VAL) / max_w;
+                    
+                    // 파일에 저장
+                    if (fp_w_write) fprintf(fp_w_write, "%d %d %f\n", j, fil, local_mul[fil]);
                 }
             }
 
-            // ===== Bias quantization =====
-            for (fil = 0; fil < l->n; ++fil) {
-
-                float bias_mul =
-                    l->input_quant_multiplier *
-                    local_mul[fil];
-
-                float b = l->biases[fil] * bias_mul;
-                l->biases_quant[fil] =
-                    max_abs(b, MAX_VAL_16);
-            }
-
-            // -------------------------------
-            // Merge to global multiplier
-            // -------------------------------
             float global_mul = 0.0f;
             for (fil = 0; fil < l->n; ++fil) {
-                if (local_mul[fil] > global_mul)
-                    global_mul = local_mul[fil];
+                // Weights quantization
+                for (i = 0; i < filter_size; ++i) {
+                    float w = l->weights[fil * filter_size + i] * local_mul[fil];
+                    l->weights_int8[fil * filter_size + i] = max_abs(w, MAX_VAL_8);
+                }
+
+                // Bias quantization
+                float bias_mul = l->input_quant_multiplier * local_mul[fil];
+                float b = l->biases[fil] * bias_mul;
+                l->biases_quant[fil] = max_abs(b, MAX_VAL_16);
+
+                if (local_mul[fil] > global_mul) global_mul = local_mul[fil];
             }
 
             l->weights_quant_multiplier = global_mul;
 
-            free(local_mul);
+            if (!has_weight_file) {
+                free(local_mul);
+            }
 
-            printf("CONV%d input=%g weight(global)=%g\n",
-                j,
-                l->input_quant_multiplier,
-                l->weights_quant_multiplier);
+            printf("CONV%d input=%g weight(global)=%g\n", j, l->input_quant_multiplier, l->weights_quant_multiplier);
         }
+    }
+
+    // 마무리
+    if (fp_w_write) fclose(fp_w_write);
+    
+    // 로드했던 캐시 메모리 해제
+    for (int k = 0; k < 200; ++k) {
+        if (cached_weight_muls[k]) free(cached_weight_muls[k]);
     }
 }
 void save_quantized_model(network net) {

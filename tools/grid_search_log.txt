@@ -15,3 +15,13 @@ bins=1024 perc=0.9999 alpha=0.15 mAP=0.763739
 bins=2048 perc=0.999 alpha=0.15 mAP=0.679163
 bins=2048 perc=0.9995 alpha=0.15 mAP=0.720866
 bins=2048 perc=0.9999 alpha=0.15 mAP=0.762778
+perc=0.999 checkpoint = 6 mAP=0.74518
+perc=0.999 checkpoint = 6 mAP=0.779074
+perc=0.999 checkpoint = 8 mAP=0.762793
+perc=0.999 checkpoint = 10 mAP=0.756649
+perc=0.9998 checkpoint = 6 mAP=0.802621
+perc=0.9998 checkpoint = 8 mAP=0.790254
+perc=0.9998 checkpoint = 10 mAP=0.792899
+perc=0.9999 checkpoint = 6 mAP=0.80736
+perc=0.9999 checkpoint = 8 mAP=0.803146
+perc=0.9999 checkpoint = 10 mAP=0.802487

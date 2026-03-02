@@ -1,1 +1,1 @@
-best: bins=None perc=None alpha=0.15 mAP=0.772372
+best: perc=0.9999 checkpoint = 6 mAP=0.80736

@@ -51,5 +51,5 @@ results:
 .PHONY: clean
 
 clean:
-	rm -rf $(OBJS) $(EXEC)
+	rm -rf $(OBJS) $(EXEC) weights_calibration_multipliers.txt
 
