@@ -2,11 +2,19 @@
 // softmax_layer.h, reorg_layer.h, route_layer.h, region_layer.h, maxpool_layer.h, convolutional_layer.h
 #include "calib_config.h"
 
-#ifndef CALIB_USE_PERCENTILE
-#define CALIB_USE_PERCENTILE 1
-#endif
+// histogram-based percentile calibration has been removed (plan_2), always use max reduction
+// percentile macro deprecated; weight quantization uses max only
 
 #define GEMMCONV
+// simple comparator for qsort used by percentile computation
+static int compare_floats(const void *p1, const void *p2)
+{
+    float a = *(const float*)p1;
+    float b = *(const float*)p2;
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
 
 //#define SSE41
 //#undef AVX
@@ -202,9 +210,30 @@ void forward_convolutional_layer_q(network net, layer l, network_state state)
     }
 
     // De-scaling or De-quantization
-    float ALPHA1 = 1 / (l.input_quant_multiplier * l.weights_quant_multiplier);
-    for (i = 0; i < l.outputs; ++i) {
-        l.output[i] = output_q[i] * ALPHA1;
+    // ---------------------------------
+    // Recompute per-channel multiplier
+    // ---------------------------------
+    size_t filter_size = l.size * l.size * l.c;
+
+    for (fil = 0; fil < l.n; ++fil) {
+
+        float max_w = 1e-6f;
+
+        for (i = 0; i < filter_size; ++i) {
+            float v = fabsf(l.weights[fil*filter_size + i]);
+            if (v > max_w) max_w = v;
+        }
+
+        float local_mul = (float)(QUANT_MAX_VAL) / max_w;
+
+        float alpha =
+            1.0f / (l.input_quant_multiplier * local_mul);
+
+        for (j = 0; j < out_size; ++j) {
+
+            int idx = fil*out_size + j;
+            l.output[idx] = output_q[idx] * alpha;
+        }
     }
 
     
@@ -330,60 +359,98 @@ void do_quantization(network net) {
             }
 
             // ===== Weight quantization (compute dynamically) =====
-            float max_weight = 1e-6f;
-            for (i = 0; i < l->size * l->size * l->c * l->n; ++i) {
-                float v = fabsf(l->weights[i]);
-                if (v > max_weight) max_weight = v;
-            }
+            // compute percentile threshold by sorting absolute weight values
+            int total_weights = l->size * l->size * l->c * l->n;
 
-#if CALIB_USE_PERCENTILE
-            int *weight_hist = (int*)calloc(CALIB_NUM_BINS, sizeof(int));
-            if (weight_hist) {
-                for (i = 0; i < l->size * l->size * l->c * l->n; ++i) {
-                    float v = fabsf(l->weights[i]);
-                    int bin = (int)((v / max_weight) * (CALIB_NUM_BINS - 1));
-                    if (bin < 0) bin = 0;
-                    if (bin >= CALIB_NUM_BINS) bin = CALIB_NUM_BINS - 1;
-                    weight_hist[bin]++;
+            float *vals = (float*)malloc(total_weights * sizeof(float));
+
+            if (vals) {
+
+                for (i = 0; i < total_weights; ++i) {
+                    vals[i] = fabsf(l->weights[i]);
                 }
-                long long total_weights = (long long)(l->size * l->size * l->c * l->n);
-                long long target = (long long)(total_weights * CALIB_PERCENTILE);
-                long long cumulative = 0;
-                float threshold = max_weight;
-                int bidx;
-                for (bidx = 0; bidx < CALIB_NUM_BINS; ++bidx) {
-                    cumulative += weight_hist[bidx];
-                    if (cumulative >= target) {
-                        threshold = ((float)bidx / (CALIB_NUM_BINS - 1)) * max_weight;
-                        break;
-                    }
-                }
-                if (threshold <= 1e-6f) threshold = 1e-6f;
-                l->weights_quant_multiplier = (float)(QUANT_MAX_VAL) / threshold;
-                free(weight_hist);
+
+                // sort ascending
+                qsort(vals, total_weights, sizeof(float), compare_floats);
+
+                long long idx_target =
+                    (long long)(total_weights * CALIB_PERCENTILE);
+
+                if (idx_target < 0)
+                    idx_target = 0;
+
+                if (idx_target >= total_weights)
+                    idx_target = total_weights - 1;
+
+                float threshold = vals[idx_target];
+
+                if (threshold <= 1e-6f)
+                    threshold = 1e-6f;
+
+                l->weights_quant_multiplier =
+                    (float)(QUANT_MAX_VAL) / threshold;
+
+                free(vals);
+
             } else {
-                l->weights_quant_multiplier = (float)(QUANT_MAX_VAL) / max_weight;
+                // fallback: max-based
+                l->weights_quant_multiplier =
+                    (float)(QUANT_MAX_VAL) / max_weight;
             }
-#else
-            l->weights_quant_multiplier = (float)(QUANT_MAX_VAL) / max_weight;
-#endif
 
             // ===== Quantize weights =====
+            // -------------------------------
+            // Per-channel local multipliers
+            // -------------------------------
+            float *local_mul = (float*)calloc(l->n, sizeof(float));
+
             for (fil = 0; fil < l->n; ++fil) {
+
+                float max_w = 1e-6f;
+
                 for (i = 0; i < filter_size; ++i) {
-                    float w = l->weights[fil*filter_size + i] * l->weights_quant_multiplier;
-                    l->weights_int8[fil*filter_size + i] = max_abs(w, MAX_VAL_8);
+                    float v = fabsf(l->weights[fil*filter_size + i]);
+                    if (v > max_w) max_w = v;
+                }
+
+                local_mul[fil] = (float)(QUANT_MAX_VAL) / max_w;
+
+                for (i = 0; i < filter_size; ++i) {
+                    float w = l->weights[fil*filter_size + i] * local_mul[fil];
+                    l->weights_int8[fil*filter_size + i] =
+                        max_abs(w, MAX_VAL_8);
                 }
             }
 
             // ===== Bias quantization =====
-            float biases_multiplier = (l->weights_quant_multiplier * l->input_quant_multiplier);
             for (fil = 0; fil < l->n; ++fil) {
-                float b = l->biases[fil] * biases_multiplier;
-                l->biases_quant[fil] = max_abs(b, MAX_VAL_16);
+
+                float bias_mul =
+                    l->input_quant_multiplier *
+                    local_mul[fil];
+
+                float b = l->biases[fil] * bias_mul;
+                l->biases_quant[fil] =
+                    max_abs(b, MAX_VAL_16);
             }
 
-            printf(" CONV%d: \t%g \t%g \t%g \n", j, l->input_quant_multiplier, l->weights_quant_multiplier, biases_multiplier);
+            // -------------------------------
+            // Merge to global multiplier
+            // -------------------------------
+            float global_mul = 0.0f;
+            for (fil = 0; fil < l->n; ++fil) {
+                if (local_mul[fil] > global_mul)
+                    global_mul = local_mul[fil];
+            }
+
+            l->weights_quant_multiplier = global_mul;
+
+            free(local_mul);
+
+            printf("CONV%d input=%g weight(global)=%g\n",
+                j,
+                l->input_quant_multiplier,
+                l->weights_quant_multiplier);
         }
     }
 }
