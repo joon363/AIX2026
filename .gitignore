@@ -1,3 +1,6 @@
 yolo_cpu/x64/Debug/*
 bin/log_feamap/*
 bin/log_param/*
+bin/calibration_multipliers.txt
+bin/darknet
+*.o
